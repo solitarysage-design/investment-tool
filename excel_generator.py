@@ -134,7 +134,12 @@ def create_investment_excel(
     _write_sheet2_candidates(wb, candidates_df)
     _write_sheet3_comparison(wb, holdings_df, candidates_df)
 
-    wb.save(output_path)
+    try:
+        wb.save(output_path)
+    except PermissionError:
+        raise PermissionError(
+            f"{Path(output_path).name} が開いています。Excelを閉じてから再実行してください。"
+        )
     return output_path
 
 
