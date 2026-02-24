@@ -428,12 +428,27 @@ class JQuantsScreener:
         if len(unique_fy_ends) == 0:
             return adj_factors
 
-        logger.info(f"  株式分割チェック ({len(unique_fy_ends)} FY末日)...")
+        # J-Quantsのデータ範囲: subscription_end がなければ今日
+        from datetime import date as _date
+        sub_end = self.client.subscription_end or datetime.now()
+        sub_start = datetime(2023, 12, 2)
 
-        for fy_end in sorted(unique_fy_ends):
+        # データ範囲内のFY末日のみ対象（check_date = fy_end - 5〜20日 が範囲内になるもの）
+        valid_fy_ends = [
+            fy for fy in unique_fy_ends
+            if (pd.Timestamp(fy) - timedelta(days=20)) <= pd.Timestamp(sub_end)
+            and (pd.Timestamp(fy) - timedelta(days=5)) >= pd.Timestamp(sub_start)
+        ]
+        logger.info(f"  株式分割チェック ({len(valid_fy_ends)}/{len(unique_fy_ends)} FY末日が範囲内)...")
+
+        for fy_end in sorted(valid_fy_ends):
             # FY末日の5〜20日前を確認（分割前の価格が取れるまで遡る）
             for delta in range(5, 21):
-                check_date = (pd.Timestamp(fy_end) - timedelta(days=delta)).strftime("%Y%m%d")
+                check_dt = pd.Timestamp(fy_end) - timedelta(days=delta)
+                # データ範囲外はスキップ
+                if check_dt > pd.Timestamp(sub_end) or check_dt < pd.Timestamp(sub_start):
+                    continue
+                check_date = check_dt.strftime("%Y%m%d")
                 try:
                     hist = self.client.get_daily_quotes(check_date)
                     if hist.empty or "Close" not in hist.columns:
