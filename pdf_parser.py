@@ -116,8 +116,27 @@ def parse_rakuten_excel(file_path: str | Path) -> pd.DataFrame:
                     raw_frames.append(frame)
                     break
             except Exception as e:
-                logger.debug(f"CSV読み込み失敗 ({enc}): {e}")
+                logger.warning(f"CSV読み込み失敗 ({enc}): {type(e).__name__}: {e}")
                 continue
+
+        # フォールバック: ファイル全体を on_bad_lines='skip' で読む
+        if not raw_frames:
+            logger.warning("セクション抽出失敗 → ファイル全体読み込みにフォールバック")
+            for enc in ("utf-8-sig", "cp932", "shift-jis", "utf-8"):
+                try:
+                    sep = _detect_csv_sep(path, enc)
+                    frame = pd.read_csv(
+                        path, header=None, dtype=str,
+                        encoding=enc, sep=sep,
+                        engine="python", on_bad_lines="skip",
+                    )
+                    if not frame.empty:
+                        raw_frames.append(frame)
+                        logger.warning(f"フォールバック読み込み成功: {enc}, sep={repr(sep)}")
+                        break
+                except Exception as e:
+                    logger.warning(f"フォールバック失敗 ({enc}): {type(e).__name__}: {e}")
+                    continue
 
     else:
         raise ValueError(f"未対応のファイル形式: {suffix}")
