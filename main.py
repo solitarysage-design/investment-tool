@@ -110,6 +110,11 @@ def main():
 
         jq_holdings_raw, candidates_df = screener.run(holdings_codes=holdings_codes)
 
+        if client.subscription_end:
+            days_old = (datetime.now() - client.subscription_end).days
+            print(f"\n  ⚠️  注意: Lightプランのため {client.subscription_end.strftime('%Y-%m-%d')} 時点の"
+                  f"データを使用しています（約{days_old}日前）")
+
         # 保有銘柄に J-Quants データを付加
         if not holdings_df.empty and not jq_holdings_raw.empty:
             holdings_df = enrich_holdings(holdings_df, jq_holdings_raw)

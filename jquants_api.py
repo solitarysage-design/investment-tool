@@ -33,6 +33,7 @@ class JQuantsClient:
         self.email = email
         self.password = password
         self.id_token: str = ""
+        self.subscription_end: datetime | None = None  # プランのデータ上限日
         self._authenticate()
 
     # ------------------------------------------------------------------
@@ -135,31 +136,55 @@ class JQuantsClient:
         return pd.DataFrame(items)
 
     def get_latest_trading_date(self) -> str:
-        """最新の取引日を取得（JST基準、祝日・障害を考慮して14日遡る）"""
+        """
+        最新の取引日を取得。
+        Lightプランなどでデータ上限日が存在する場合は、
+        エラーメッセージから上限日を自動検出してその日付から検索する。
+        """
+        import re as _re
         from datetime import timezone
         JST = timezone(timedelta(hours=9))
-        # Streamlit Cloud は UTC なので JST に補正する
         today = datetime.now(JST).replace(tzinfo=None)
 
+        # まず今日の日付で試して、サブスクリプション上限日を検出する
+        search_from = today
+        try:
+            data = self._get("prices/daily_quotes", {"date": today.strftime("%Y%m%d")})
+            if data.get("daily_quotes"):
+                return today.strftime("%Y%m%d")
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 400:
+                # "covers the following dates: 2023-12-02 ~ 2025-12-02" から上限日を取得
+                found = _re.findall(r"\d{4}-\d{2}-\d{2}", e.response.text)
+                if len(found) >= 2:
+                    sub_end = datetime.strptime(found[-1], "%Y-%m-%d")
+                    logger.warning(
+                        f"プランのデータ対象期間: {found[0]} 〜 {found[-1]}\n"
+                        f"  → {found[-1]} 時点のデータを使用します（注意: 約{(today - sub_end).days}日前のデータ）"
+                    )
+                    self.subscription_end = sub_end
+                    search_from = sub_end
+        except Exception:
+            pass
+
+        # search_from から最大14日遡って最新の取引日を探す
         errors: list[str] = []
         for i in range(14):
-            candidate = (today - timedelta(days=i)).strftime("%Y%m%d")
+            candidate = (search_from - timedelta(days=i)).strftime("%Y%m%d")
             try:
-                # コードを指定せず日付だけ渡して全銘柄データを取得
                 data = self._get("prices/daily_quotes", {"date": candidate})
                 if data.get("daily_quotes"):
                     logger.info(f"最新取引日: {candidate}")
                     return candidate
                 logger.debug(f"{candidate}: daily_quotes が空（休場日）")
             except Exception as e:
-                msg = f"{candidate}: {e}"
-                errors.append(msg)
-                logger.warning(f"取引日チェック失敗 {msg}")
+                errors.append(f"{candidate}: {e}")
+                logger.warning(f"取引日チェック失敗 {candidate}: {e}")
             time.sleep(0.3)
 
         detail = "\n".join(errors[-5:]) if errors else "なし"
         raise RuntimeError(
-            f"最新取引日の取得に失敗しました（過去14日間）\n"
+            f"最新取引日の取得に失敗しました（{search_from.strftime('%Y-%m-%d')} から14日間）\n"
             f"直近エラー:\n{detail}"
         )
 
@@ -176,7 +201,8 @@ class JQuantsClient:
               決算発表が集中する期間（5月・8月・11月・2月）をカバーするため
               一定期間をスキャンする。
         """
-        today = datetime.now()
+        # subscription_end があればそこから、なければ今日から起算
+        today = self.subscription_end or datetime.now()
         all_statements: list[dict] = []
 
         # 週次でサンプリング（APIコール数を抑える）
