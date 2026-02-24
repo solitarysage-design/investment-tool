@@ -361,10 +361,17 @@ class JQuantsScreener:
         else:
             prices["price"] = prices.get("close")
 
-        # コード列の型統一（5桁の場合もあるので str で統一）
-        for df in [listed, prices, statements]:
+        # コード列の型統一
+        # fins/statements の LocalCode は5桁（例: "14140"）
+        # listed/info・prices は4桁（例: "1414"）なので末尾1桁を除いて統一
+        for df in [listed, prices]:
             if "code" in df.columns:
-                df["code"] = df["code"].astype(str).str.strip()
+                df["code"] = df["code"].astype(str).str.strip().str[:4]
+        if "code" in statements.columns:
+            statements["code"] = (
+                statements["code"].astype(str).str.strip()
+                .apply(lambda x: x[:4] if len(x) == 5 else x)
+            )
 
         # マージ
         df = listed[["code", "name", "sector17", "sector33", "market"]].merge(

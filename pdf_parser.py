@@ -111,24 +111,34 @@ def parse_rakuten_excel(file_path: str | Path) -> pd.DataFrame:
     elif suffix == ".csv":
         for enc in ("utf-8-sig", "cp932", "shift-jis", "utf-8"):
             try:
-                # タブ区切りか自動検出（楽天証券はタブ区切りTSV）
-                sep = _detect_csv_sep(path, enc)
-                raw_frames.append(
-                    pd.read_csv(path, header=None, dtype=str,
-                                encoding=enc, sep=sep, engine="python")
-                )
-                break
-            except (UnicodeDecodeError, Exception):
+                frame = _read_rakuten_csv_section(path, enc)
+                if frame is not None and not frame.empty:
+                    raw_frames.append(frame)
+                    break
+            except Exception as e:
+                logger.debug(f"CSV読み込み失敗 ({enc}): {e}")
                 continue
 
     else:
         raise ValueError(f"未対応のファイル形式: {suffix}")
 
     if not raw_frames:
-        raise ValueError("ファイルを読み込めませんでした")
+        raise ValueError(
+            "ファイルを読み込めませんでした\n"
+            "  ・楽天証券の「保有商品一覧」CSVか確認してください\n"
+            "  ・ファイルに「銘柄コード」列が含まれているか確認してください"
+        )
 
     records: list[dict] = []
     for frame in raw_frames:
+        # _read_rakuten_csv_section はヘッダー付きDFを返す
+        # _extract_from_dataframe は header=None 前提なのでヘッダー行を先頭に追加して変換
+        if isinstance(frame.columns[0], str) and not str(frame.columns[0]).isdigit():
+            header_row = pd.DataFrame([frame.columns.tolist()])
+            data_part  = frame.copy()
+            data_part.columns = range(len(data_part.columns))
+            header_row.columns = range(len(header_row.columns))
+            frame = pd.concat([header_row, data_part], ignore_index=True)
         records.extend(_extract_from_dataframe(frame))
 
     if not records:
@@ -161,6 +171,55 @@ def _detect_csv_sep(path: Path, encoding: str) -> str:
     except Exception:
         pass
     return "\t"   # 楽天証券はデフォルトでタブ区切り
+
+
+def _read_rakuten_csv_section(path: Path, encoding: str) -> "pd.DataFrame | None":
+    """
+    楽天証券CSVから「銘柄コード」ヘッダー行と4桁コード行のみを抽出して返す。
+    集計行・サマリー行・空行はすべて無視する。
+    """
+    import io as _io
+
+    with open(path, encoding=encoding, errors="replace") as f:
+        content = f.read()
+
+    lines = content.splitlines()
+
+    # 「銘柄コード」を含むヘッダー行を探す
+    header_idx: int | None = None
+    sep = "\t"
+    for i, line in enumerate(lines):
+        if "銘柄コード" in line:
+            header_idx = i
+            sep = "\t" if line.count("\t") >= line.count(",") else ","
+            break
+
+    if header_idx is None:
+        logger.debug(f"'銘柄コード' 行が見つかりません ({encoding})")
+        return None
+
+    # ヘッダー行 + 4桁コードで始まるデータ行のみ収集
+    selected = [lines[header_idx]]
+    for line in lines[header_idx + 1:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        first_cell = stripped.split(sep)[0].strip()
+        if re.match(r"^\d{4}$", first_cell):
+            selected.append(stripped)
+
+    if len(selected) < 2:
+        logger.debug(f"データ行が見つかりません (ヘッダー行: {header_idx})")
+        return None
+
+    df = pd.read_csv(
+        _io.StringIO("\n".join(selected)),
+        sep=sep,
+        dtype=str,
+        engine="python",
+    )
+    logger.info(f"  CSV解析: {len(df)} 行を取得 (区切り={repr(sep)}, encoding={encoding})")
+    return df
 
 
 def _extract_from_dataframe(df: pd.DataFrame) -> list[dict]:
