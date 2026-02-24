@@ -29,7 +29,7 @@ _COL_PATTERNS = {
     "name":            ["銘柄名", "銘柄", "銘柄・ファンド名"],
     "account_type":    ["口座区分", "口座", "口座種別"],
     "quantity":        ["保有株数", "保有数量", "数量", "保有口数"],
-    "avg_cost":        ["平均取得単価", "取得単価", "取得価格", "平均取得価格"],
+    "avg_cost":        ["平均取得単価", "平均取得価額", "取得単価", "取得価格", "平均取得価格"],
     "current_price":   ["現在値", "株価", "基準価額"],
     "assessed_value":  ["評価額", "時価評価額"],
     "unrealized_pl":   ["評価損益(円)", "評価損益額", "評価損益", "損益(円)", "損益額"],
@@ -111,8 +111,11 @@ def parse_rakuten_excel(file_path: str | Path) -> pd.DataFrame:
     elif suffix == ".csv":
         for enc in ("utf-8-sig", "cp932", "shift-jis", "utf-8"):
             try:
+                # タブ区切りか自動検出（楽天証券はタブ区切りTSV）
+                sep = _detect_csv_sep(path, enc)
                 raw_frames.append(
-                    pd.read_csv(path, header=None, dtype=str, encoding=enc)
+                    pd.read_csv(path, header=None, dtype=str,
+                                encoding=enc, sep=sep, engine="python")
                 )
                 break
             except (UnicodeDecodeError, Exception):
@@ -139,6 +142,25 @@ def parse_rakuten_excel(file_path: str | Path) -> pd.DataFrame:
     df = _clean_dataframe(df)
     logger.info(f"  → {len(df)} 銘柄を取得")
     return df
+
+
+def _detect_csv_sep(path: Path, encoding: str) -> str:
+    """CSVの区切り文字を自動検出（タブ vs カンマ）"""
+    try:
+        with open(path, encoding=encoding, errors="replace") as f:
+            for _ in range(5):          # 先頭5行で判定
+                line = f.readline()
+                if not line:
+                    break
+                tabs   = line.count("\t")
+                commas = line.count(",")
+                if tabs > commas:
+                    return "\t"
+                if commas > tabs and commas > 2:
+                    return ","
+    except Exception:
+        pass
+    return "\t"   # 楽天証券はデフォルトでタブ区切り
 
 
 def _extract_from_dataframe(df: pd.DataFrame) -> list[dict]:
@@ -490,5 +512,16 @@ def _clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     # assessed_value が空の場合は計算で補完
     mask = df["assessed_value"].isna() & df["quantity"].notna() & df["current_price"].notna()
     df.loc[mask, "assessed_value"] = df.loc[mask, "quantity"] * df.loc[mask, "current_price"]
+
+    # unrealized_pct が空の場合は計算で補完（楽天CSVには列がないため）
+    if "unrealized_pct" not in df.columns:
+        df["unrealized_pct"] = None
+    df["unrealized_pct"] = pd.to_numeric(df["unrealized_pct"], errors="coerce")
+    mask_pct = (df["unrealized_pct"].isna()
+                & df["unrealized_pl"].notna()
+                & df["assessed_value"].notna()
+                & (df["assessed_value"] - df["unrealized_pl"]) != 0)
+    cost = df.loc[mask_pct, "assessed_value"] - df.loc[mask_pct, "unrealized_pl"]
+    df.loc[mask_pct, "unrealized_pct"] = df.loc[mask_pct, "unrealized_pl"] / cost * 100
 
     return df.reset_index(drop=True)
