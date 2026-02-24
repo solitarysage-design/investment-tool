@@ -355,11 +355,10 @@ class JQuantsScreener:
             "CurrentFiscalYearEndDate": "fy_end_date",
         })
 
-        # 株価はAdjustmentCloseを優先、なければClose
-        if "adj_close" in prices.columns:
-            prices["price"] = prices["adj_close"].combine_first(prices.get("close"))
-        else:
-            prices["price"] = prices.get("close")
+        # 株価は実際のClose（非調整）を使用
+        # AdjustmentCloseは株式分割で実株価より低くなるため、
+        # 配当利回り・PBRの計算に使うと値が正しくなくなる
+        prices["price"] = pd.to_numeric(prices.get("close"), errors="coerce")
 
         # コード列の型統一
         # fins/statements の LocalCode は5桁（例: "14140"）
