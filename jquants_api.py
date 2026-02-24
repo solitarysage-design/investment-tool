@@ -355,11 +355,6 @@ class JQuantsScreener:
             "CurrentFiscalYearEndDate": "fy_end_date",
         })
 
-        # 株価は実際のClose（非調整）を使用
-        # AdjustmentCloseは株式分割で実株価より低くなるため、
-        # 配当利回り・PBRの計算に使うと値が正しくなくなる
-        prices["price"] = pd.to_numeric(prices.get("close"), errors="coerce")
-
         # コード列の型統一
         # fins/statements の LocalCode は5桁（例: "14140"）
         # listed/info・prices は4桁（例: "1414"）なので末尾1桁を除いて統一
@@ -371,6 +366,17 @@ class JQuantsScreener:
                 statements["code"].astype(str).str.strip()
                 .apply(lambda x: x[:4] if len(x) == 5 else x)
             )
+
+        # 株価は実際のClose（非調整）を使用
+        # AdjustmentCloseは株式分割で実株価より低くなるため、
+        # 配当利回り・PBRの計算に使うと値が正しくなくなる
+        prices["price"] = pd.to_numeric(prices.get("close"), errors="coerce")
+
+        # 株式分割調整: FY末日前のAdjClose/Close比率からDPS補正ファクターを取得
+        # J-QuantsはDPSを分割前ベースで記録しているが株価は分割後のため利回りが過大になる
+        split_adj = self._get_split_adjustment_factors(
+            statements.get("fy_end_date", pd.Series(dtype=str))
+        )
 
         # マージ
         df = listed[["code", "name", "sector17", "sector33", "market"]].merge(
@@ -386,6 +392,13 @@ class JQuantsScreener:
         for col in ["price", "bps", "dps_result", "dps_forecast", "shares_outstanding"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
+        # 株式分割調整の適用（DPSを分割後ベースに変換、shares_outstandingを実際の株数に修正）
+        if split_adj:
+            adj = df["code"].map(split_adj).fillna(1.0)
+            df["dps_result"]       = df["dps_result"]       * adj
+            df["dps_forecast"]     = df["dps_forecast"]     * adj
+            df["shares_outstanding"] = df["shares_outstanding"] / adj
+
         # DPS: 結果値を優先、なければ予測値
         df["dps"] = df["dps_result"].combine_first(df["dps_forecast"])
 
@@ -395,6 +408,53 @@ class JQuantsScreener:
         df["market_cap"] = df["shares_outstanding"] * df["price"]
 
         return df
+
+    def _get_split_adjustment_factors(self, fy_end_dates: pd.Series) -> dict:
+        """
+        各銘柄のFY末日10日前のAdjClose/Close比率から株式分割補正ファクターを返す。
+
+        J-QuantsはDPS・shares_outstandingを分割前ベースで記録するが、
+        株価（Close）は分割後の実際の価格。AdjClose = Close × 分割補正なので
+        FY末日前の AdjClose/Close = 分割後ベースへの変換ファクター。
+
+        Returns: {4桁コード: adj_ratio}  (比率が1.0の場合は分割なし)
+        """
+        adj_factors: dict[str, float] = {}
+
+        unique_fy_ends = (
+            pd.to_datetime(fy_end_dates, errors="coerce")
+            .dropna().dt.normalize().unique()
+        )
+        if len(unique_fy_ends) == 0:
+            return adj_factors
+
+        logger.info(f"  株式分割チェック ({len(unique_fy_ends)} FY末日)...")
+
+        for fy_end in sorted(unique_fy_ends):
+            # FY末日の5〜20日前を確認（分割前の価格が取れるまで遡る）
+            for delta in range(5, 21):
+                check_date = (pd.Timestamp(fy_end) - timedelta(days=delta)).strftime("%Y%m%d")
+                try:
+                    hist = self.client.get_daily_quotes(check_date)
+                    if hist.empty or "Close" not in hist.columns:
+                        continue
+                    close = pd.to_numeric(hist["Close"], errors="coerce")
+                    adj   = pd.to_numeric(hist.get("AdjustmentClose", close), errors="coerce")
+                    codes = hist["Code"].astype(str).str[:4]
+                    ratio = (adj / close).where(close > 0)
+                    for code, r in zip(codes, ratio):
+                        if code not in adj_factors and pd.notna(r):
+                            adj_factors[code] = float(r)
+                    time.sleep(0.3)
+                    break  # この fy_end に対して有効な取引日が見つかった
+                except Exception as e:
+                    logger.debug(f"  分割チェック {check_date}: {e}")
+                    continue
+
+        n_splits = sum(1 for v in adj_factors.values() if v < 0.99)
+        if n_splits:
+            logger.info(f"  株式分割検出: {n_splits} 銘柄にDPS調整を適用")
+        return adj_factors
 
     # ------------------------------------------------------------------
     # 内部: フィルタリング
