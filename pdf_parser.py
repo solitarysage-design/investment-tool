@@ -119,20 +119,28 @@ def parse_rakuten_excel(file_path: str | Path) -> pd.DataFrame:
                 logger.warning(f"CSV読み込み失敗 ({enc}): {type(e).__name__}: {e}")
                 continue
 
-        # フォールバック: ファイル全体を on_bad_lines='skip' で読む
+        # フォールバック: 行数・列数が不均一でもすべての行を読む
         if not raw_frames:
             logger.warning("セクション抽出失敗 → ファイル全体読み込みにフォールバック")
             for enc in ("utf-8-sig", "cp932", "shift-jis", "utf-8"):
                 try:
                     sep = _detect_csv_sep(path, enc)
-                    frame = pd.read_csv(
-                        path, header=None, dtype=str,
-                        encoding=enc, sep=sep,
-                        engine="python", on_bad_lines="skip",
-                    )
-                    if not frame.empty:
+                    with open(path, encoding=enc, errors="replace") as _f:
+                        all_lines = _f.readlines()
+                    # 各行を個別にパースして最大列数に合わせる
+                    import csv as _csv, io as _io
+                    rows = []
+                    for ln in all_lines:
+                        try:
+                            rows.append(next(_csv.reader([ln], delimiter=sep)))
+                        except Exception:
+                            continue
+                    if rows:
+                        max_cols = max(len(r) for r in rows)
+                        padded = [r + [""] * (max_cols - len(r)) for r in rows]
+                        frame = pd.DataFrame(padded, dtype=str)
                         raw_frames.append(frame)
-                        logger.warning(f"フォールバック読み込み成功: {enc}, sep={repr(sep)}")
+                        logger.warning(f"フォールバック読み込み成功: {enc}, sep={repr(sep)}, {len(frame)}行")
                         break
                 except Exception as e:
                     logger.warning(f"フォールバック失敗 ({enc}): {type(e).__name__}: {e}")
@@ -223,7 +231,7 @@ def _read_rakuten_csv_section(path: Path, encoding: str) -> "pd.DataFrame | None
         stripped = line.strip()
         if not stripped:
             continue
-        first_cell = stripped.split(sep)[0].strip()
+        first_cell = stripped.split(sep)[0].strip().strip('"').strip("'")
         if re.match(r"^\d{4}$", first_cell):
             selected.append(stripped)
 
