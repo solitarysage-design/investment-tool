@@ -77,6 +77,138 @@ def parse_rakuten_pdf(pdf_path: str | Path) -> pd.DataFrame:
     return df
 
 
+def parse_rakuten_excel(file_path: str | Path) -> pd.DataFrame:
+    """
+    楽天証券「保有商品一覧」Excel または CSV ファイルを解析する。
+
+    対応形式:
+      - .xlsx / .xls  (楽天証券のExcelエクスポート)
+      - .csv          (楽天証券のCSVエクスポート、Shift-JIS / UTF-8 対応)
+
+    Returns
+    -------
+    pd.DataFrame  (parse_rakuten_pdf と同じ列構成)
+    """
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"ファイルが見つかりません: {path.resolve()}")
+
+    logger.info(f"Excel/CSV 解析開始: {path.name}")
+    suffix = path.suffix.lower()
+
+    raw_frames: list[pd.DataFrame] = []
+
+    if suffix in (".xlsx", ".xls"):
+        xl = pd.ExcelFile(path)
+        for sheet in xl.sheet_names:
+            try:
+                raw_frames.append(
+                    pd.read_excel(path, sheet_name=sheet, header=None, dtype=str)
+                )
+            except Exception as e:
+                logger.debug(f"シート {sheet} 読み込み失敗: {e}")
+
+    elif suffix == ".csv":
+        for enc in ("utf-8-sig", "cp932", "shift-jis", "utf-8"):
+            try:
+                raw_frames.append(
+                    pd.read_csv(path, header=None, dtype=str, encoding=enc)
+                )
+                break
+            except (UnicodeDecodeError, Exception):
+                continue
+
+    else:
+        raise ValueError(f"未対応のファイル形式: {suffix}")
+
+    if not raw_frames:
+        raise ValueError("ファイルを読み込めませんでした")
+
+    records: list[dict] = []
+    for frame in raw_frames:
+        records.extend(_extract_from_dataframe(frame))
+
+    if not records:
+        raise ValueError(
+            "Excel/CSVから保有銘柄を抽出できませんでした。\n"
+            "  ・楽天証券の「保有商品一覧」をダウンロードしたファイルか確認してください\n"
+            "  ・国内株式の行に4桁の銘柄コードが含まれているか確認してください"
+        )
+
+    df = pd.DataFrame(records)
+    df = _clean_dataframe(df)
+    logger.info(f"  → {len(df)} 銘柄を取得")
+    return df
+
+
+def _extract_from_dataframe(df: pd.DataFrame) -> list[dict]:
+    """
+    任意の DataFrame から銘柄コード行を探して保有銘柄リストを返す。
+    ヘッダー行の有無・位置を自動検出する。
+    """
+    records: list[dict] = []
+
+    # --- ヘッダー行を探す ---
+    col_map: dict[str, int] = {}
+    header_row_idx: int = -1
+
+    for idx, row in df.iterrows():
+        cells = [str(c).strip() if pd.notna(c) else "" for c in row]
+        tmp_map: dict[str, int] = {}
+        for j, cell in enumerate(cells):
+            for field, patterns in _COL_PATTERNS.items():
+                if field not in tmp_map and any(p in cell for p in patterns):
+                    tmp_map[field] = j
+        # 2列以上マッチしたらヘッダーと判断
+        if len(tmp_map) >= 2:
+            col_map = tmp_map
+            header_row_idx = int(str(idx))
+            break
+
+    # --- データ行を抽出 ---
+    for idx, row in df.iterrows():
+        if int(str(idx)) <= header_row_idx:
+            continue
+
+        cells = [str(c).strip() if pd.notna(c) else "" for c in row]
+
+        # 4桁コードを探す
+        code: str | None = None
+        if "code" in col_map:
+            candidate = cells[col_map["code"]] if col_map["code"] < len(cells) else ""
+            if re.match(r"^\d{4}$", candidate):
+                code = candidate
+        if not code:
+            for c in cells:
+                if re.match(r"^\d{4}$", c):
+                    code = c
+                    break
+        if not code:
+            continue
+
+        def get(field: str):
+            i = col_map.get(field)
+            return cells[i] if i is not None and i < len(cells) else None
+
+        name = get("name") or ""
+        if not name:
+            continue
+
+        records.append({
+            "code":           code,
+            "name":           name,
+            "account_type":   get("account_type") or "",
+            "quantity":       _to_float(get("quantity")),
+            "avg_cost":       _to_float(get("avg_cost")),
+            "current_price":  _to_float(get("current_price")),
+            "assessed_value": _to_float(get("assessed_value")),
+            "unrealized_pl":  _to_float(get("unrealized_pl")),
+            "unrealized_pct": _to_float(get("unrealized_pct")),
+        })
+
+    return records
+
+
 def save_to_csv(df: pd.DataFrame, output_path: str | Path) -> None:
     """保有銘柄DataFrameをCSVに保存"""
     output_path = Path(output_path)

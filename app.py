@@ -23,7 +23,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-from pdf_parser import parse_rakuten_pdf
+from pdf_parser import parse_rakuten_pdf, parse_rakuten_excel
 from jquants_api import JQuantsClient, JQuantsScreener, enrich_holdings
 from excel_generator import create_investment_excel
 
@@ -102,9 +102,9 @@ st.divider()
 
 # --- PDF アップロード ---
 uploaded_file = st.file_uploader(
-    "📄 楽天証券「保有商品一覧」PDF",
-    type=["pdf"],
-    help="楽天証券アプリ → 保有商品一覧 → PDF出力 でダウンロードしたファイルを選択",
+    "📄 楽天証券「保有商品一覧」PDF / Excel / CSV",
+    type=["pdf", "xlsx", "xls", "csv"],
+    help="楽天証券 → 保有商品一覧 → ダウンロード（PDF・Excel・CSV いずれも対応）",
 )
 
 if uploaded_file:
@@ -161,20 +161,25 @@ if run_btn:
 
     with st.status("分析中... 数分かかります", expanded=True) as status:
 
-        # STEP 1: PDF 解析
+        # STEP 1: ファイル解析（PDF / Excel / CSV）
         if uploaded_file:
-            st.write("📄 PDF を解析中...")
+            suffix = Path(uploaded_file.name).suffix.lower()
+            label = "PDF" if suffix == ".pdf" else "Excel/CSV"
+            st.write(f"📄 {label} を解析中...")
             try:
-                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
                     tmp.write(uploaded_file.getvalue())
                     tmp_path = tmp.name
-                holdings_df = parse_rakuten_pdf(tmp_path)
+                if suffix == ".pdf":
+                    holdings_df = parse_rakuten_pdf(tmp_path)
+                else:
+                    holdings_df = parse_rakuten_excel(tmp_path)
                 Path(tmp_path).unlink(missing_ok=True)
                 st.write(f"　→ {len(holdings_df)} 銘柄の保有情報を取得")
             except Exception as e:
-                st.warning(f"　PDF解析に失敗: {e}\n　スクリーニングのみ実行します")
+                st.warning(f"　{label}解析に失敗: {e}\n　スクリーニングのみ実行します")
         else:
-            st.write("📄 PDF なし → スクリーニングのみ実行します")
+            st.write("　ファイルなし → スクリーニングのみ実行します")
 
         # STEP 2: J-Quants スクリーニング
         st.write("🔍 J-Quants API でスクリーニング中...")

@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 import config
-from pdf_parser import parse_rakuten_pdf, save_to_csv
+from pdf_parser import parse_rakuten_pdf, parse_rakuten_excel, save_to_csv
 from jquants_api import JQuantsClient, JQuantsScreener, enrich_holdings
 from excel_generator import create_investment_excel
 
@@ -67,7 +67,11 @@ def main():
 
     if config.PDF_PATH.exists():
         try:
-            holdings_df = parse_rakuten_pdf(config.PDF_PATH)
+            suffix = config.PDF_PATH.suffix.lower()
+            if suffix == ".pdf":
+                holdings_df = parse_rakuten_pdf(config.PDF_PATH)
+            else:
+                holdings_df = parse_rakuten_excel(config.PDF_PATH)
             print(f"  保有銘柄: {len(holdings_df)} 銘柄")
             holdings_codes = holdings_df["code"].tolist()
 
