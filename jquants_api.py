@@ -61,9 +61,10 @@ class JQuantsClient:
         logger.info("J-Quants 認証成功")
 
     def _get(self, endpoint: str, params: dict | None = None) -> dict:
-        """認証付きGETリクエスト（429レート制限時にリトライ）"""
+        """認証付きGETリクエスト（リトライ付き）"""
         headers = {"Authorization": f"Bearer {self.id_token}"}
         url = f"{_BASE_URL}/{endpoint}"
+        last_exc: Exception | None = None
 
         for attempt in range(4):
             try:
@@ -73,13 +74,26 @@ class JQuantsClient:
                     logger.warning(f"レート制限 → {wait}秒待機")
                     time.sleep(wait)
                     continue
+                # 4xx/5xx を例外化する前にレスポンスボディをログ
+                if not resp.ok:
+                    logger.warning(
+                        f"HTTP {resp.status_code} [{endpoint}] body={resp.text[:200]}"
+                    )
                 resp.raise_for_status()
                 return resp.json()
-            except requests.exceptions.Timeout:
-                logger.warning(f"タイムアウト (試行 {attempt + 1}/4)")
+            except requests.exceptions.HTTPError as e:
+                last_exc = e
+                # 4xx は基本リトライしない（5xx のみリトライ）
+                if resp.status_code < 500:
+                    raise
+                logger.warning(f"サーバーエラー {resp.status_code}、リトライ ({attempt+1}/4)")
+                time.sleep(10 * (attempt + 1))
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                last_exc = e
+                logger.warning(f"通信エラー (試行 {attempt+1}/4): {e}")
                 time.sleep(10)
 
-        raise RuntimeError(f"APIリクエスト失敗: {endpoint}")
+        raise RuntimeError(f"APIリクエスト失敗 [{endpoint}]: {last_exc}")
 
     def _get_paginated(self, endpoint: str, key: str, params: dict | None = None) -> list:
         """ページネーション対応のGETリクエスト"""
@@ -121,24 +135,33 @@ class JQuantsClient:
         return pd.DataFrame(items)
 
     def get_latest_trading_date(self) -> str:
-        """最新の取引日を取得"""
-        today = datetime.now()
-        # 土日は金曜日に戻す
-        if today.weekday() == 5:  # 土曜
-            today -= timedelta(days=1)
-        elif today.weekday() == 6:  # 日曜
-            today -= timedelta(days=2)
-        # 祝日対応は省略（APIが空を返すので翌日に遡る）
-        for i in range(7):
+        """最新の取引日を取得（JST基準、祝日・障害を考慮して14日遡る）"""
+        from datetime import timezone
+        JST = timezone(timedelta(hours=9))
+        # Streamlit Cloud は UTC なので JST に補正する
+        today = datetime.now(JST).replace(tzinfo=None)
+
+        errors: list[str] = []
+        for i in range(14):
             candidate = (today - timedelta(days=i)).strftime("%Y%m%d")
             try:
+                # コードを指定せず日付だけ渡して全銘柄データを取得
                 data = self._get("prices/daily_quotes", {"date": candidate})
                 if data.get("daily_quotes"):
+                    logger.info(f"最新取引日: {candidate}")
                     return candidate
-            except Exception:
-                pass
-            time.sleep(0.5)
-        raise RuntimeError("最新取引日の取得に失敗しました")
+                logger.debug(f"{candidate}: daily_quotes が空（休場日）")
+            except Exception as e:
+                msg = f"{candidate}: {e}"
+                errors.append(msg)
+                logger.warning(f"取引日チェック失敗 {msg}")
+            time.sleep(0.3)
+
+        detail = "\n".join(errors[-5:]) if errors else "なし"
+        raise RuntimeError(
+            f"最新取引日の取得に失敗しました（過去14日間）\n"
+            f"直近エラー:\n{detail}"
+        )
 
     # ------------------------------------------------------------------
     # バルク財務データ収集

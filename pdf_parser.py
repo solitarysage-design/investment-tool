@@ -23,17 +23,17 @@ logger = logging.getLogger(__name__)
 # ▲ や △ はマイナス（含み損）を意味する
 _MINUS_PREFIXES = ("▲", "△", "－", "−")
 
-# 楽天証券の列名パターン（部分一致）
+# 楽天証券の列名パターン（部分一致・複数バージョン対応）
 _COL_PATTERNS = {
-    "code":            ["銘柄コード", "コード"],
-    "name":            ["銘柄名", "銘柄"],
-    "account_type":    ["口座区分", "口座"],
-    "quantity":        ["保有株数", "保有数量", "数量"],
-    "avg_cost":        ["平均取得単価", "取得単価", "取得価格"],
-    "current_price":   ["現在値", "株価"],
-    "assessed_value":  ["評価額"],
-    "unrealized_pl":   ["評価損益(円)", "評価損益額", "評価損益"],
-    "unrealized_pct":  ["評価損益率", "損益率"],
+    "code":            ["銘柄コード", "コード", "証券コード"],
+    "name":            ["銘柄名", "銘柄", "銘柄・ファンド名"],
+    "account_type":    ["口座区分", "口座", "口座種別"],
+    "quantity":        ["保有株数", "保有数量", "数量", "保有口数"],
+    "avg_cost":        ["平均取得単価", "取得単価", "取得価格", "平均取得価格"],
+    "current_price":   ["現在値", "株価", "基準価額"],
+    "assessed_value":  ["評価額", "時価評価額"],
+    "unrealized_pl":   ["評価損益(円)", "評価損益額", "評価損益", "損益(円)", "損益額"],
+    "unrealized_pct":  ["評価損益率", "損益率", "損益(%)"],
 }
 
 
@@ -90,47 +90,49 @@ def save_to_csv(df: pd.DataFrame, output_path: str | Path) -> None:
 # ---------------------------------------------------------------------------
 
 def _try_table_extraction(pdf: pdfplumber.PDF) -> list[dict]:
-    """pdfplumber の extract_tables() を使用してデータ抽出"""
-    records = []
-    in_domestic_section = False
+    """
+    pdfplumber でテーブル抽出。
+    楽天証券PDFは罫線のないレイアウトが多いため、4つの戦略を順に試みる。
+    """
+    # 戦略リスト（strict → 緩い順）
+    STRATEGIES = [
+        {"vertical_strategy": "lines_strict", "horizontal_strategy": "lines_strict",
+         "intersection_tolerance": 5},
+        {"vertical_strategy": "lines",        "horizontal_strategy": "lines",
+         "intersection_tolerance": 5},
+        {"vertical_strategy": "text",         "horizontal_strategy": "lines",
+         "text_tolerance": 5},
+        {"vertical_strategy": "text",         "horizontal_strategy": "text",
+         "text_tolerance": 5, "text_x_tolerance": 3},
+    ]
 
+    records = []
     for page_num, page in enumerate(pdf.pages):
         page_text = page.extract_text() or ""
 
-        # 「国内株式」セクションを追跡
-        if "国内株式" in page_text:
-            in_domestic_section = True
-        if "外国株式" in page_text or "投資信託" in page_text:
-            # 国内株式セクションが終わったと判断（次セクション開始）
-            # ただし同一ページに国内株式もある可能性があるので継続
-            pass
+        for strategy in STRATEGIES:
+            try:
+                tables = page.extract_tables(table_settings=strategy)
+            except Exception:
+                tables = []
 
-        tables = page.extract_tables(
-            table_settings={
-                "vertical_strategy": "lines_strict",
-                "horizontal_strategy": "lines_strict",
-                "intersection_tolerance": 5,
-            }
-        )
-
-        # より緩い設定でも試みる
-        if not tables:
-            tables = page.extract_tables()
-
-        for table in tables:
-            if not table or len(table) < 2:
-                continue
-
-            header_idx, col_map = _find_header(table)
-            if header_idx is None or not col_map:
-                continue
-
-            for row in table[header_idx + 1:]:
-                if not row:
+            found_in_page = []
+            for table in tables:
+                if not table or len(table) < 2:
                     continue
-                rec = _row_to_record(row, col_map)
-                if rec:
-                    records.append(rec)
+                header_idx, col_map = _find_header(table)
+                if header_idx is None or not col_map:
+                    continue
+                for row in table[header_idx + 1:]:
+                    if not row:
+                        continue
+                    rec = _row_to_record(row, col_map)
+                    if rec:
+                        found_in_page.append(rec)
+
+            if found_in_page:
+                records.extend(found_in_page)
+                break  # このページは成功したので次の戦略は不要
 
     return records
 
@@ -198,8 +200,9 @@ def _row_to_record(row: list, col_map: dict) -> dict | None:
 
 def _try_text_extraction(pdf: pdfplumber.PDF) -> list[dict]:
     """
-    PDFテキストから正規表現で銘柄コード・銘柄名・数値を抽出するフォールバック。
-    テーブル構造が取得できない場合に使用。
+    PDFテキストから銘柄情報を抽出するフォールバック。
+    楽天証券のPDFは値が改行で区切られていることがあるため、
+    「4桁コード行」を起点に前後の行から数値を収集する。
     """
     records = []
     full_text = ""
@@ -208,21 +211,21 @@ def _try_text_extraction(pdf: pdfplumber.PDF) -> list[dict]:
         if t:
             full_text += t + "\n"
 
-    # 4桁コード + 銘柄名 + 複数の数値が並ぶ行パターン
-    # 例: "1234 ○○株式会社 特定 100 1,000 1,200 120,000 20,000 20.00"
-    pattern = re.compile(
-        r"(\d{4})\s+"           # 銘柄コード
-        r"([\S][^\d▲△\n]+?)\s+" # 銘柄名（数字・記号以外）
-        r"(?:(特定|一般|NISA|つみたて)\s+)?"  # 口座区分（省略可）
-        r"([\d,]+)\s+"           # 保有株数
-        r"([\d,]+(?:\.\d+)?)\s+" # 平均取得単価
-        r"([\d,]+(?:\.\d+)?)\s+" # 現在値
-        r"([\d,]+)\s+"           # 評価額
-        r"([▲△]?[\d,]+)\s+"     # 評価損益
-        r"([▲△]?[\d.]+)"        # 評価損益率
-    )
+    lines = full_text.split("\n")
 
-    for m in pattern.finditer(full_text):
+    # --- パターン1: 1行にすべてまとまっている場合 ---
+    pattern_oneline = re.compile(
+        r"(\d{4})\s+"
+        r"([^\d▲△\n]+?)\s+"
+        r"(?:(特定|一般|NISA|つみたてNISA|成長投資枠|特定口座|一般口座)\s+)?"
+        r"([\d,]+)\s+"
+        r"([\d,]+(?:\.\d+)?)\s+"
+        r"([\d,]+(?:\.\d+)?)\s+"
+        r"([\d,]+)\s+"
+        r"([▲△]?[\d,]+(?:\.\d+)?)\s+"
+        r"([▲△]?[\d.]+)"
+    )
+    for m in pattern_oneline.finditer(full_text):
         records.append({
             "code":           m.group(1),
             "name":           m.group(2).strip(),
@@ -235,7 +238,90 @@ def _try_text_extraction(pdf: pdfplumber.PDF) -> list[dict]:
             "unrealized_pct": _to_float(m.group(9)),
         })
 
+    if records:
+        return records
+
+    # --- パターン2: 4桁コード行を起点に周辺行から数値を収集 ---
+    # 楽天証券の一部PDFは各値が別行になっている
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        m = re.match(r"^(\d{4})$", line)  # 4桁コードだけの行
+        if not m:
+            # コードが行頭にある場合も対応
+            m = re.match(r"^(\d{4})\s+(\S.*)$", line)
+        if m:
+            code = m.group(1)
+            # 前後10行から銘柄名と数値を収集
+            window = lines[max(0, i-2):min(len(lines), i+12)]
+            name = _extract_name_from_window(window, code)
+            numbers = _extract_numbers_from_window(window)
+
+            if name and len(numbers) >= 4:
+                records.append({
+                    "code":           code,
+                    "name":           name,
+                    "account_type":   _extract_account_type(window),
+                    "quantity":       numbers[0] if len(numbers) > 0 else None,
+                    "avg_cost":       numbers[1] if len(numbers) > 1 else None,
+                    "current_price":  numbers[2] if len(numbers) > 2 else None,
+                    "assessed_value": numbers[3] if len(numbers) > 3 else None,
+                    "unrealized_pl":  numbers[4] if len(numbers) > 4 else None,
+                    "unrealized_pct": numbers[5] if len(numbers) > 5 else None,
+                })
+        i += 1
+
     return records
+
+
+def _extract_name_from_window(lines: list[str], code: str) -> str:
+    """周辺行から銘柄名を探す"""
+    for line in lines:
+        line = line.strip()
+        if re.match(r"^\d{4}", line):
+            # コード行の残り部分
+            rest = re.sub(r"^\d{4}\s*", "", line).strip()
+            # 先頭の日本語/英字部分を銘柄名と見なす
+            m = re.match(r"^([^\d▲△,]{2,40})", rest)
+            if m:
+                return m.group(1).strip()
+        # 日本語が多い行を銘柄名候補と見なす
+        jp_count = sum(1 for c in line if '\u3000' <= c <= '\u9fff' or '\uff00' <= c <= '\uffef')
+        if jp_count >= 2 and not re.search(r"[\d,]{4,}", line):
+            return line[:40].strip()
+    return ""
+
+
+def _extract_numbers_from_window(lines: list[str]) -> list[float | None]:
+    """周辺行から数値を順に収集する"""
+    numbers = []
+    for line in lines:
+        line = line.strip()
+        # ▲/△ をマイナスに変換して数値抽出
+        is_neg = line.startswith(("▲", "△"))
+        cleaned = re.sub(r"[▲△,\s円%]", "", line)
+        try:
+            val = float(cleaned)
+            numbers.append(-val if is_neg else val)
+        except ValueError:
+            # 数値と非数値が混在する行（例: "1,000 特定"）からも抽出
+            for part in re.findall(r"[▲△]?[\d,]+(?:\.\d+)?", line):
+                neg = part.startswith(("▲", "△"))
+                try:
+                    numbers.append(-float(re.sub(r"[▲△,]", "", part)) if neg
+                                   else float(re.sub(r",", "", part)))
+                except ValueError:
+                    pass
+    return numbers
+
+
+def _extract_account_type(lines: list[str]) -> str:
+    """口座区分を周辺行から探す"""
+    for line in lines:
+        for kw in ("特定", "一般", "NISA", "つみたて", "成長投資"):
+            if kw in line:
+                return kw
+    return ""
 
 
 # ---------------------------------------------------------------------------

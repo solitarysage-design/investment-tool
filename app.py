@@ -109,6 +109,22 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file:
     st.success(f"✅ {uploaded_file.name}")
+
+    # PDF デバッグパネル（解析失敗時に確認用）
+    with st.expander("🔍 PDF 生テキスト確認（解析がうまくいかない場合に展開）"):
+        try:
+            import pdfplumber, io as _io, tempfile
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as _tmp:
+                _tmp.write(uploaded_file.getvalue())
+                _tmp_path = _tmp.name
+            with pdfplumber.open(_tmp_path) as _pdf:
+                for _pn, _pg in enumerate(_pdf.pages[:3]):
+                    st.caption(f"--- Page {_pn+1} ---")
+                    _txt = _pg.extract_text() or "（テキスト抽出なし）"
+                    st.text(_txt[:1500])
+            Path(_tmp_path).unlink(missing_ok=True)
+        except Exception as _e:
+            st.warning(f"デバッグ表示エラー: {_e}")
 else:
     st.info("PDFなしでも実行できます（スクリーニングのみ）")
 
@@ -181,7 +197,18 @@ if run_btn:
 
         except Exception as e:
             status.update(label="❌ J-Quants API エラー", state="error")
-            st.error(f"エラー内容: {e}\n\n認証情報・ネットワーク接続を確認してください")
+            err_str = str(e)
+            st.error(f"**J-Quants API エラー**\n\n{err_str}")
+            if "取引日" in err_str:
+                st.info(
+                    "💡 **取引日取得エラーの対処法**\n"
+                    "- J-Quants の Light プランに登録済みか確認してください\n"
+                    "- `prices/daily_quotes` エンドポイントへのアクセス権限があるか確認してください\n"
+                    "- J-Quants のステータスページでサービス障害がないか確認してください\n"
+                    "- エラー詳細（HTTP ステータスコード）はログを確認してください"
+                )
+            elif "401" in err_str or "認証" in err_str:
+                st.info("💡 メールアドレス・パスワードが正しいか確認してください")
             st.stop()
 
         # STEP 3: Excel 生成
